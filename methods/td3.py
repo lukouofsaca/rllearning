@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import os
 from utils.ReplayBuffer import ReplayBuffer
+from .registry import register_method
+from .abstract_methods import RLMethod
+
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, max_action):
@@ -50,129 +53,100 @@ class Critic(nn.Module):
         q1 = F.relu(self.l2(q1))
         return self.l3(q1)
 
-class TD3:
-    def __init__(self, state_dim, action_dim, max_action):
+@register_method("td3")
+class TD3(RLMethod):
+    def __init__(self, state_dim, action_dim, max_action, 
+                 actor=None,critic=None,
+                 params=None,):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.actor = Actor(state_dim, action_dim, max_action).to(self.device)
-        self.actor_target = Actor(state_dim, action_dim, max_action).to(self.device)
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
+        if params is None:
+            params = {}
+        self.max_action = max_action
+        self.discount = params.get("discount", 0.99)
+        self.tau = params.get("tau", 0.005)
+        self.policy_noise = params.get("policy_noise", 0.2)
+        self.noise_clip = params.get("noise_clip", 0.5)
+        self.policy_freq = params.get("policy_freq", 2)
+        self.params = params
 
-        self.critic = Critic(state_dim, action_dim).to(self.device)
-        self.critic_target = Critic(state_dim, action_dim).to(self.device)
-        self.critic_target.load_state_dict(self.critic.state_dict())
+        # actor and critic networks
+        if actor is None:
+            self.actor = Actor(state_dim, action_dim, max_action).to(self.device)
+        else:
+            self.actor = actor.to(self.device)
+        if critic is None:
+            self.critic = Critic(state_dim, action_dim).to(self.device)
+        else:
+            self.critic = critic.to(self.device)
+
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
-        self.max_action = max_action
         self.it = 0
-
+        self.replay_buffer = ReplayBuffer()
+        self.use_replay_buffer = False if self.params.get("use_replay_buffer", False) else True
+    
     def select_action(self, state):
         state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
         return self.actor(state).cpu().data.numpy().flatten()
+    
+    def store_transition(self, transition):
+        self.replay_buffer.add(transition)
 
-    def train(self, replay_buffer, batch_size=256, gamma=0.99, tau=0.005, policy_noise=0.2, noise_clip=0.5, policy_freq=2):
+    def update(self, batch_size: int = 256):
         self.it += 1
-        state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
+
+        # Sample replay buffer 
+        state, action, next_state, reward, not_done = self.replay_buffer.sample(batch_size)
+        state = torch.FloatTensor(state).to(self.device)
+        action = torch.FloatTensor(action).to(self.device)
+        next_state = torch.FloatTensor(next_state).to(self.device)
+        reward = torch.FloatTensor(reward).to(self.device)
+        not_done = torch.FloatTensor(not_done).to(self.device)
 
         with torch.no_grad():
-            noise = (torch.randn_like(action) * policy_noise).clamp(-noise_clip, noise_clip)
-            next_action = (self.actor_target(next_state) + noise).clamp(-self.max_action, self.max_action)
-            target_Q1, target_Q2 = self.critic_target(next_state, next_action)
-            target_Q = reward + not_done * gamma * torch.min(target_Q1, target_Q2)
+            # Select action according to policy and add clipped noise 
+            noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            next_action = (self.actor(next_state) + noise).clamp(-self.max_action, self.max_action)
 
+            # Compute the target Q value
+            target_Q1, target_Q2 = self.critic(next_state, next_action)
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = reward + not_done * self.discount * target_Q
+
+        # Get current Q estimates
         current_Q1, current_Q2 = self.critic(state, action)
+
+        # Compute critic loss
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
+        # Optimize the critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        if self.it % policy_freq == 0:
+        # Delayed policy updates
+        if self.it % self.policy_freq == 0:
+            # Compute actor loss
             actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
+            
+            # Optimize the actor 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
-
-            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
-if __name__ == "__main__":
-    # Note: CartPole-v1 is discrete. TD3 is for continuous actions. 
-    # Using Pendulum-v1 as a standard continuous environment.
-    env = gym.make("Pendulum-v1", render_mode="rgb_array")
-
-    env = RecordVideo(
-        env,
-        video_folder="videos/",
-        episode_trigger=lambda ep_id: ep_id % 100 == 0,  # 每10个episode存一次
-        name_prefix="td3_pendulum"
-    )
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-    max_action = float(env.action_space.high[0])
-
-    agent = TD3(state_dim, action_dim, max_action)
-
-    # --- checkpoint / save setup ---
-    save_dir = "checkpoints"
-    os.makedirs(save_dir, exist_ok=True)
-    SAVE_EVERY = 5000  # save every N training iterations
-
-    def _save(path=None):
-        if path is None:
-            path = os.path.join(save_dir, f"td3_iter_{agent.it}.pt")
+    
+    def save(self, path):
         torch.save({
-            'actor': agent.actor.state_dict(),
-            'actor_target': agent.actor_target.state_dict(),
-            'critic': agent.critic.state_dict(),
-            'critic_target': agent.critic_target.state_dict(),
-            'actor_optimizer': agent.actor_optimizer.state_dict(),
-            'critic_optimizer': agent.critic_optimizer.state_dict(),
-            'it': agent.it,
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'type': 'td3'
         }, path)
 
-    def _load(path):
-        ckpt = torch.load(path, map_location=agent.device)
-        agent.actor.load_state_dict(ckpt['actor'])
-        agent.actor_target.load_state_dict(ckpt['actor_target'])
-        agent.critic.load_state_dict(ckpt['critic'])
-        agent.critic_target.load_state_dict(ckpt['critic_target'])
-        agent.actor_optimizer.load_state_dict(ckpt['actor_optimizer'])
-        agent.critic_optimizer.load_state_dict(ckpt['critic_optimizer'])
-        agent.it = ckpt.get('it', agent.it)
-
-    agent.save = _save
-    agent.load = _load
-
-    # wrap train to automatically save periodically
-    _orig_train = agent.train
-    def _train_and_maybe_save(*args, **kwargs):
-        _orig_train(*args, **kwargs)
-        if agent.it % SAVE_EVERY == 0:
-            agent.save(os.path.join(save_dir, f"td3_iter_{agent.it}.pt"))
-            # also keep a "latest" copy
-            agent.save(os.path.join(save_dir, "td3_latest.pt"))
-    agent.train = _train_and_maybe_save
-    replay_buffer = ReplayBuffer(state_dim, action_dim)
-
-    state, _ = env.reset()
-    for t in tqdm(range(int(1e5))):
-        if t < 1000:
-            action = env.action_space.sample()
-        else:
-            action = (agent.select_action(state) + np.random.normal(0, 0.1, size=action_dim)).clip(-max_action, max_action)
-
-        next_state, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        replay_buffer.add(state, action, next_state, reward, done)
-        state = next_state
-
-        if t >= 1000:
-            agent.train(replay_buffer)
-
-        if done:
-
-            state, _ = env.reset()
-    env.close()
+    def load(self, path):
+        checkpoint = torch.load(path)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
