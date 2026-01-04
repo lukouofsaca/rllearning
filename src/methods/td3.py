@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import os
 from utils.ReplayBuffer import ReplayBuffer
-from .registry import register_method
-from .abstract_methods import RLMethod
+from methods.registry import register_method
+from methods.abstract_methods import RLMethod
 
 
 class Actor(nn.Module):
@@ -57,7 +57,7 @@ class Critic(nn.Module):
 class TD3(RLMethod):
     def __init__(self, state_dim, action_dim, max_action, 
                  actor=None,critic=None,
-                 params=None,):
+                     params=None,):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if params is None:
             params = {}

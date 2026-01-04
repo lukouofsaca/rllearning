@@ -7,11 +7,6 @@ from tqdm import tqdm
 from methods import get_method
 import argparse
 
-
-
-
-
-
 if __name__ == "__main__":
     # argparse for different methods
     parser = argparse.ArgumentParser()

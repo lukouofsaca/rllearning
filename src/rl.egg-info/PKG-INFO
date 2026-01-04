@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: rl
+Version: 0.1.0
+Summary: Custom reinforcement learning framework
+Requires-Python: >=3.9
+License-File: LICENSE
+Dynamic: license-file

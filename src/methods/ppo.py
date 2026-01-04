@@ -9,8 +9,8 @@ from torch.distributions import Normal
 from gymnasium.wrappers import RecordVideo
 from tqdm import tqdm
 import os
-from .registry import register_method
-from .abstract_methods import RLMethod
+from methods.registry import register_method
+from methods.abstract_methods import RLMethod
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, max_action, hidden_dim=256):
         super(Actor, self).__init__()
