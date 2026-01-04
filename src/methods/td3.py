@@ -1,16 +1,42 @@
-import gymnasium as gym
+# an td3 file for RL
+import copy
 import numpy as np
 import torch
-from gymnasium.wrappers import RecordVideo
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from tqdm import tqdm
-import os
-from utils.ReplayBuffer import ReplayBuffer
 from methods.registry import register_method
 from methods.abstract_methods import RLMethod
+class ReplayBuffer():
+    def __init__(self, state_dim, action_dim, max_size=int(1e6)):
+        self.max_size = max_size
+        self.ptr = 0
+        self.size = 0
+        self.state = np.zeros((max_size, state_dim))
+        self.action = np.zeros((max_size, action_dim))
+        self.next_state = np.zeros((max_size, state_dim))
+        self.reward = np.zeros((max_size, 1))
+        self.not_done = np.zeros((max_size, 1))
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    def add(self, state, action, next_state, reward, done):
+        self.state[self.ptr] = state
+        self.action[self.ptr] = action
+        self.next_state[self.ptr] = next_state
+        self.reward[self.ptr] = reward
+        self.not_done[self.ptr] = 1. - done
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
+    def sample(self, batch_size):
+        ind = np.random.randint(0, self.size, size=batch_size)
+        return (
+            torch.FloatTensor(self.state[ind]).to(self.device),
+            torch.FloatTensor(self.action[ind]).to(self.device),
+            torch.FloatTensor(self.next_state[ind]).to(self.device),
+            torch.FloatTensor(self.reward[ind]).to(self.device),
+            torch.FloatTensor(self.not_done[ind]).to(self.device)
+        )
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, max_action):
@@ -53,115 +79,78 @@ class Critic(nn.Module):
         q1 = F.relu(self.l2(q1))
         return self.l3(q1)
 
-@register_method("td3")
-class TD3(RLMethod):
-    def __init__(self, state_dim, action_dim, max_action, 
-                 actor=None,critic=None,
-                     params=None,):
+@register_method(name='td3')
+class TD3:
+    def __init__(self, state_dim, action_dim, max_action,params):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if params is None:
-            params = {}
-        self.max_action = max_action
-        self.discount = params.get("discount", 0.99)
-        self.tau = params.get("tau", 0.005)
-        self.policy_noise = params.get("policy_noise", 0.2)
-        self.noise_clip = params.get("noise_clip", 0.5)
-        self.policy_freq = params.get("policy_freq", 2)
-        self.params = params
-
-        # actor and critic networks
-        if actor is None:
-            self.actor = Actor(state_dim, action_dim, max_action).to(self.device)
-        else:
-            self.actor = actor.to(self.device)
-        if critic is None:
-            self.critic = Critic(state_dim, action_dim).to(self.device)
-        else:
-            self.critic = critic.to(self.device)
-
+        self.actor = Actor(state_dim, action_dim, max_action).to(self.device)
+        self.actor_target = Actor(state_dim, action_dim, max_action).to(self.device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
+
+        self.critic = Critic(state_dim, action_dim).to(self.device)
+        self.critic_target = Critic(state_dim, action_dim).to(self.device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
+        self.max_action = max_action
         self.it = 0
         self.replay_buffer = ReplayBuffer(state_dim, action_dim)
-        self.use_replay_buffer = False if self.params.get("use_replay_buffer", False) else True
-    
+
     def select_action(self, state):
         state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
-        
-        action = self.actor(state).cpu().data.numpy().flatten()
-        # TD3 has no logprob or value output
-        logprob = np.array([0.0])
-        value = np.array([0.0])
-        return action, logprob, value
-    
+        return self.actor(state).cpu().data.numpy().flatten(),None,None
+
     def store_transition(self, transition):
-        state, next_state, action, action_logprob, reward, done, value = transition
-        not_done = 1.0 - done
-        transition = (state, action, next_state, reward, not_done)  
-        self.replay_buffer.add(state, action, next_state, reward, not_done)
+        state, next_state,action, action_logprob, reward, done, value = transition
+        self.replay_buffer.add(state, action, next_state, reward, done)
 
-    def update(self, batch_size: int = 256):
+
+    def update(self, batch_size=256, gamma=0.99, tau=0.005, policy_noise=0.2, noise_clip=0.5, policy_freq=2):
         self.it += 1
-
-        # Sample replay buffer 
-        
         state, action, next_state, reward, not_done = self.replay_buffer.sample(batch_size)
-        # try:
-        #     state = torch.FloatTensor(state).to(self.device)
-        #     action = torch.FloatTensor(action).to(self.device)
-        #     next_state = torch.FloatTensor(next_state).to(self.device)
-        #     reward = torch.FloatTensor(reward).to(self.device)
-        #     not_done = torch.FloatTensor(not_done).to(self.device)
-        # except:
-
-        #     print("state: ", state)
-        #     print("action: ", action)
-        #     raise Exception("Error")
 
         with torch.no_grad():
-            # Select action according to policy and add clipped noise 
-            noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
-            next_action = (self.actor(next_state) + noise).clamp(-self.max_action, self.max_action)
+            noise = (torch.randn_like(action) * policy_noise).clamp(-noise_clip, noise_clip)
+            next_action = (self.actor_target(next_state) + noise).clamp(-self.max_action, self.max_action)
+            target_Q1, target_Q2 = self.critic_target(next_state, next_action)
+            target_Q = reward + not_done * gamma * torch.min(target_Q1, target_Q2)
 
-            # Compute the target Q value
-            target_Q1, target_Q2 = self.critic(next_state, next_action)
-            target_Q = torch.min(target_Q1, target_Q2)
-            target_Q = reward + not_done * self.discount * target_Q
-
-        # Get current Q estimates
         current_Q1, current_Q2 = self.critic(state, action)
-
-        # Compute critic loss
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
-        # Optimize the critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        # Delayed policy updates
-        if self.it % self.policy_freq == 0:
-            # Compute actor loss
+        if self.it % policy_freq == 0:
             actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
-            
-            # Optimize the actor 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
-    
-    def save(self, path):
+
+            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+    def save(self,path=None):
         torch.save({
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-            'type': 'td3'
+            'actor': self.actor.state_dict(),
+            'actor_target': self.actor_target.state_dict(),
+            'critic': self.critic.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+            'it': self.it,
         }, path)
 
-    def load(self, path):
-        checkpoint = torch.load(path)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+    def load(self,path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(ckpt['actor'])
+        self.actor_target.load_state_dict(ckpt['actor_target'])
+        self.critic.load_state_dict(ckpt['critic'])
+        self.critic_target.load_state_dict(ckpt['critic_target'])
+        self.actor_optimizer.load_state_dict(ckpt['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(ckpt['critic_optimizer'])
+        self.it = ckpt.get('it', self.it)
