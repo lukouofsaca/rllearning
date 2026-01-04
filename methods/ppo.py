@@ -151,7 +151,7 @@ if __name__ == "__main__":
     # 视频录制
     env = RecordVideo(
         env,
-        video_folder="videos/",
+        video_folder="output/videos/",
         episode_trigger=lambda ep_id: ep_id % 100 == 0,
         name_prefix="ppo_pendulum"
     )
@@ -162,7 +162,7 @@ if __name__ == "__main__":
 
     agent = PPO(state_dim, action_dim, max_action)
     
-    save_dir = "checkpoints"
+    save_dir = "output/checkpoints"
     os.makedirs(save_dir, exist_ok=True)
 
     max_episodes = 1000
