@@ -1,0 +1,4 @@
+# Enable Raptor mini (Preview) for all clients
+raptor_mini_preview: true
+scope: all_clients
+description: "Enable Raptor mini (Preview) for all clients"
