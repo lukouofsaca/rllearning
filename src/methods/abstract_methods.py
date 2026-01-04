@@ -11,6 +11,11 @@ class RLMethod(ABC):
         pass
 
     @abstractmethod
+    def select_action(self, state):
+        pass
+
+
+    @abstractmethod
     def update(self, states ,batch_size: int = 256):
         pass
 

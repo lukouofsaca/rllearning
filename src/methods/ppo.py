@@ -24,10 +24,9 @@ class Actor(nn.Module):
         x = F.relu(self.l1(state))
         x = F.relu(self.l2(x))
         # 使用 tanh 将输出限制在 [-1, 1]，然后缩放到 [ -max_action, max_action ]
-        mu = self.max_action * torch.tanh(self.mu(x))
+        mu = self.mu(x)
         std = torch.exp(self.log_std)
         return mu, std
-
     def get_dist(self, state):
         mu, std = self.forward(state)
         return Normal(mu, std)
@@ -89,6 +88,8 @@ class PPO(RLMethod):
         return action.cpu().data.numpy().flatten(), action_logprob.cpu().data.numpy().flatten(), value.cpu().data.numpy().flatten()
 
     def store_transition(self, transition):
+        state, next_state, action, action_logprob, reward, done, value = transition
+        transition = (state, action, action_logprob, reward, done, value)
         self.buffer.append(transition)
 
     def update(self):
@@ -103,18 +104,23 @@ class PPO(RLMethod):
 
         # 计算 Returns 和 GAE (Generalized Advantage Estimation)
         returns = []
+        advantages = []
         gae = 0
         with torch.no_grad():
             # 假设最后一个状态后的 value 为 0 (如果是固定步数 rollout)
             next_value = 0 
             for reward, is_terminal, value in zip(reversed(rewards), reversed(is_terminals), reversed(values)):
-                delta = reward + self.gamma * next_value * (1 - is_terminal) - value
-                gae = delta + self.gamma * self.gae_lambda * (1 - is_terminal) * gae
+                mask = 1.0 - is_terminal
+                delta = reward + self.gamma * next_value * mask - value
+                gae = delta + self.gamma * self.gae_lambda * mask * gae
+
+                advantages.insert(0, gae)
                 returns.insert(0, gae + value)
+
                 next_value = value
 
         returns = torch.FloatTensor(returns).to(self.device).detach()
-        advantages = (returns - values.detach())
+        advantages = torch.FloatTensor(advantages).to(self.device).detach()
         # 优势函数归一化
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -133,7 +139,11 @@ class PPO(RLMethod):
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
             # 总损失 = 策略损失 + 价值损失 - 熵奖励
-            loss = -torch.min(surr1, surr2) + 0.5 * F.mse_loss(state_values, returns) - 0.01 * dist_entropy
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = F.mse_loss(state_values, returns)
+            entropy_loss = -dist_entropy.mean()
+
+            loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
 
             self.optimizer.zero_grad()
             loss.mean().backward()

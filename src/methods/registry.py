@@ -4,7 +4,8 @@ def register_method(name: str):
     def decorator(cls):
         key = name.lower()
         if key in _METHOD_REGISTRY:
-            raise KeyError(f"Method '{name}' already registered")
+            # raise KeyError(f"Method '{name}' already registered")
+            pass
         _METHOD_REGISTRY[key] = cls
         return cls
     return decorator

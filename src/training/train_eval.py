@@ -13,10 +13,10 @@ if __name__ == "__main__":
     
     parser.add_argument('--method', type=str, default='ppo', help='RL method to use')
     parser.add_argument('--env', type=str, default='Pendulum-v1', help='Gym environment name')
-    parser.add_argument('--episodes', type=int, default=1000, help='Number of training episodes')
+    parser.add_argument('--episodes', type=int, default=10000, help='Number of training episodes')
     parser.add_argument('--record-video', type=bool, default=True, help='Whether to record videos')
     parser.add_argument('--video-dir', type=str, default='output/videos', help='Directory to save videos')
-    parser.add_argument('--video-interval', type=int, default=100, help='Interval of episodes to record video')
+    parser.add_argument('--video-interval', type=int, default=500, help='Interval of episodes to record video')
     parser.add_argument('--checkpoint-dir', type=str, default='output/checkpoints', help='Directory to save checkpoints')
     parser.add_argument('--checkpoint-interval', type=int, default=100, help='Interval of episodes to save checkpoints')
     
@@ -25,15 +25,15 @@ if __name__ == "__main__":
 
     # 训练配置
     env_name = args.env
-    env = gym.make(env_name, render_mode="rgb_array")
+    env = gym.make(env_name, render_mode=None)
 
     # 视频录制
-    env = RecordVideo(
-        env,
-        video_folder=args.video_dir,
-        episode_trigger=lambda ep_id: ep_id % args.video_interval == 0,
-        name_prefix=f"{args.method}_{args.env}"
-    )
+    # env = RecordVideo(
+    #     env,
+    #     video_folder=args.video_dir,
+    #     episode_trigger=lambda ep_id: ep_id % args.video_interval == 0,
+    #     name_prefix=f"{args.method}_{args.env}"
+    # )
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -61,7 +61,7 @@ if __name__ == "__main__":
             done = terminated or truncated
             
             # 存储轨迹
-            agent.store_transition((state, action, action_logprob, reward, done, value))
+            agent.store_transition((state, next_state, action, action_logprob, reward, done, value))
             
             state = next_state
             episode_reward += reward

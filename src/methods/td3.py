@@ -83,26 +83,41 @@ class TD3(RLMethod):
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
         self.it = 0
-        self.replay_buffer = ReplayBuffer()
+        self.replay_buffer = ReplayBuffer(state_dim, action_dim)
         self.use_replay_buffer = False if self.params.get("use_replay_buffer", False) else True
     
     def select_action(self, state):
         state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
-        return self.actor(state).cpu().data.numpy().flatten()
+        
+        action = self.actor(state).cpu().data.numpy().flatten()
+        # TD3 has no logprob or value output
+        logprob = np.array([0.0])
+        value = np.array([0.0])
+        return action, logprob, value
     
     def store_transition(self, transition):
-        self.replay_buffer.add(transition)
+        state, next_state, action, action_logprob, reward, done, value = transition
+        not_done = 1.0 - done
+        transition = (state, action, next_state, reward, not_done)  
+        self.replay_buffer.add(state, action, next_state, reward, not_done)
 
     def update(self, batch_size: int = 256):
         self.it += 1
 
         # Sample replay buffer 
+        
         state, action, next_state, reward, not_done = self.replay_buffer.sample(batch_size)
-        state = torch.FloatTensor(state).to(self.device)
-        action = torch.FloatTensor(action).to(self.device)
-        next_state = torch.FloatTensor(next_state).to(self.device)
-        reward = torch.FloatTensor(reward).to(self.device)
-        not_done = torch.FloatTensor(not_done).to(self.device)
+        # try:
+        #     state = torch.FloatTensor(state).to(self.device)
+        #     action = torch.FloatTensor(action).to(self.device)
+        #     next_state = torch.FloatTensor(next_state).to(self.device)
+        #     reward = torch.FloatTensor(reward).to(self.device)
+        #     not_done = torch.FloatTensor(not_done).to(self.device)
+        # except:
+
+        #     print("state: ", state)
+        #     print("action: ", action)
+        #     raise Exception("Error")
 
         with torch.no_grad():
             # Select action according to policy and add clipped noise 
