@@ -2,7 +2,19 @@
 from abc import ABC, abstractmethod
 import torch
 
-class RLMethod(ABC):
+
+class ABSRLMethod(ABC):
+    @abstractmethod
+    # variable parameters can be added as needed
+    def __init__(self, *args, **kwargs):
+        pass
+
+    @abstractmethod
+    def update(self, *args, **kwargs):
+        pass
+    
+    
+class RLMethod(ABSRLMethod):
     
     @abstractmethod
     def __init__(self, state_dim: int, action_dim: int, max_action: float, params=None):
@@ -38,3 +50,8 @@ class RLMethod(ABC):
     @abstractmethod
     def load(self, path):
         pass
+
+class OnPolicyMethod(RLMethod):
+    @abstractmethod
+    def __init__(self, state_dim: int, action_dim: int, max_action: float, params=None):
+        super(OnPolicyMethod, self).__init__(state_dim, action_dim, max_action, params)
