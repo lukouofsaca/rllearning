@@ -5,6 +5,7 @@ src/envs/__init__.py
 src/envs/env.py
 src/methods/__init__.py
 src/methods/abstract_methods.py
+src/methods/dqn.py
 src/methods/ppo.py
 src/methods/registry.py
 src/methods/td3.py

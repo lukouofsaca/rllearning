@@ -1,29 +1,25 @@
 # an ppo file for RL
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Normal
-from gymnasium.wrappers import RecordVideo
-from tqdm import tqdm
-import os
 from methods.registry import register_method
 from methods.abstract_methods import RLMethod
+
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, max_action, hidden_dim=256):
         super(Actor, self).__init__()
         self.l1 = nn.Linear(state_dim, hidden_dim)
         self.l2 = nn.Linear(hidden_dim, hidden_dim)
         self.mu = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
+        self.log_std = nn.Parameter(torch.ones(1, action_dim) * -0.5)
         self.max_action = max_action
 
     def forward(self, state):
         x = F.relu(self.l1(state))
         x = F.relu(self.l2(x))
-        # 使用 tanh 将输出限制在 [-1, 1]，然后缩放到 [ -max_action, max_action ]
         mu = self.max_action * torch.tanh(self.mu(x))
         std = torch.exp(self.log_std)
         return mu, std
@@ -46,27 +42,20 @@ class Critic(nn.Module):
 
 @register_method("ppo")
 class PPO(RLMethod):
-    def __init__(self, state_dim, action_dim, max_action, 
-                 actor=None,critic=None,
-                 params=None,):
+    def __init__(self, state_dim, action_dim, max_action, params=None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if params is None:
             params = {}
-        # TODO: use
+        self.params = params
         self.gamma = params.get("gamma", 0.99)
-        self.eps_clip = params.get("eps_clip",0.2)
-        self.gae_lambda = params.get("gae_lambda",0.95)
-        self.K_epochs = params.get("K_epochs",10)
+        self.eps_clip = params.get("eps_clip", 0.2)
+        self.gae_lambda = params.get("gae_lambda", 0.95)
+        self.K_epochs = params.get("K_epochs", 10)
+        self.lr = params.get("lr", 3e-4)
         self.max_action = max_action
-        self.lr = params.get("lr",3e-4)
-        if actor is None:
-            self.actor = Actor(state_dim, action_dim, max_action).to(self.device)
-        else:
-            self.actor = actor.to(self.device)
-        if critic is None:
-            self.critic = Critic(state_dim).to(self.device)
-        else:
-            self.critic = critic.to(self.device)
+
+        self.actor = Actor(state_dim, action_dim, max_action).to(self.device)
+        self.critic = Critic(state_dim).to(self.device)
 
         self.optimizer = optim.Adam([
             {'params': self.actor.parameters(), 'lr': self.lr},
@@ -77,78 +66,116 @@ class PPO(RLMethod):
         self.it = 0
 
     def select_action(self, state):
-        state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
+        # state: (num_envs, state_dim) or (state_dim,)
+        if isinstance(state, tuple):
+            state = state[0]
+        if len(state.shape) == 1:
+            state = state.reshape(1, -1)
+        
+        state = torch.FloatTensor(state).to(self.device)
         with torch.no_grad():
             dist = self.actor.get_dist(state)
             action = dist.sample()
             action_logprob = dist.log_prob(action).sum(dim=-1)
             value = self.critic(state)
         
-        # 裁剪动作到环境允许范围
         action = torch.clamp(action, -self.max_action, self.max_action)
-        return action.cpu().data.numpy().flatten(), action_logprob.cpu().data.numpy().flatten(), value.cpu().data.numpy().flatten()
+        return action.cpu().data.numpy(), action_logprob.cpu().data.numpy(), value.cpu().data.numpy()
 
     def store_transition(self, transition):
+        # transition: (state, next_state, action, action_logprob, reward, done, value)
+        # We store the batch directly.
         self.buffer.append(transition)
 
     def update(self):
-        self.it += 1
-        # 将 buffer 中的数据转换为 tensor
-        states = torch.FloatTensor(np.array([t[0] for t in self.buffer])).to(self.device)
-        actions = torch.FloatTensor(np.array([t[1] for t in self.buffer])).to(self.device)
-        old_logprobs = torch.FloatTensor(np.array([t[2] for t in self.buffer])).to(self.device)
-        rewards = [t[3] for t in self.buffer]
-        is_terminals = [t[4] for t in self.buffer]
-        values = torch.FloatTensor(np.array([t[5] for t in self.buffer])).to(self.device)
+        if len(self.buffer) == 0:
+            return
 
-        # 计算 Returns 和 GAE (Generalized Advantage Estimation)
-        returns = []
-        gae = 0
+        # Optimize buffer processing: Transpose list of tuples to tuple of lists
+        batch = list(zip(*self.buffer))
+        
+        # Convert to tensors efficiently
+        # Stack along time dimension (dim 0)
+        # Result shape: (buffer_steps, num_envs, ...)
+        states = torch.tensor(np.array(batch[0]), dtype=torch.float32).to(self.device)
+        # next_states = torch.tensor(np.array(batch[1]), dtype=torch.float32).to(self.device)
+        actions = torch.tensor(np.array(batch[2]), dtype=torch.float32).to(self.device)
+        old_logprobs = torch.tensor(np.array(batch[3]), dtype=torch.float32).to(self.device)
+        rewards = torch.tensor(np.array(batch[4]), dtype=torch.float32).to(self.device)
+        dones = torch.tensor(np.array(batch[5]), dtype=torch.float32).to(self.device)
+        values = torch.tensor(np.array(batch[6]), dtype=torch.float32).to(self.device)
+
+        # Calculate Advantages using GAE
         with torch.no_grad():
-            # 假设最后一个状态后的 value 为 0 (如果是固定步数 rollout)
-            next_value = 0 
-            for reward, is_terminal, value in zip(reversed(rewards), reversed(is_terminals), reversed(values)):
-                delta = reward + self.gamma * next_value * (1 - is_terminal) - value
-                gae = delta + self.gamma * self.gae_lambda * (1 - is_terminal) * gae
-                returns.insert(0, gae + value)
-                next_value = value
+            # We need next states for all steps to compute next_values
+            # But actually we only need next_values for the GAE calculation.
+            # If we stored next_states, we can use them.
+            next_states = torch.tensor(np.array(batch[1]), dtype=torch.float32).to(self.device)
+            next_values = self.critic(next_states).squeeze(-1) # (buffer_steps, num_envs)
+            
+            # Values shape: (buffer_steps, num_envs) (if critic output is (batch, 1))
+            if values.dim() == 3: values = values.squeeze(-1)
+            
+            # delta = r + gamma * V(s') * (1-done) - V(s)
+            deltas = rewards + self.gamma * next_values * (1 - dones) - values
+            
+            # Vectorized GAE calculation
+            deltas_np = deltas.cpu().numpy()
+            dones_np = dones.cpu().numpy()
+            advantages_np = np.zeros_like(deltas_np)
+            gae = 0
+            
+            # Loop backwards over time steps
+            for t in reversed(range(len(deltas_np))):
+                # If done, reset GAE. dones_np[t] is (num_envs,)
+                # We need to handle masking per environment.
+                # gae = delta + gamma * lambda * gae * (1 - done)
+                gae = deltas_np[t] + self.gamma * self.gae_lambda * gae * (1 - dones_np[t])
+                advantages_np[t] = gae
+                
+            advantages = torch.tensor(advantages_np, dtype=torch.float32).to(self.device)
+        
+        returns = advantages + values
 
-        returns = torch.FloatTensor(returns).to(self.device).detach()
-        advantages = (returns - values.detach())
-        # 优势函数归一化
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Flatten the batch for training: (buffer_steps * num_envs, ...)
+        states = states.reshape(-1, states.shape[-1])
+        actions = actions.reshape(-1, actions.shape[-1])
+        old_logprobs = old_logprobs.reshape(-1)
+        returns = returns.reshape(-1)
+        advantages = advantages.reshape(-1)
+        
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
 
-        # 迭代 K 次进行策略和价值网络更新
+        # Optimize policy for K epochs
         for _ in range(self.K_epochs):
+            # Calculate current logprobs and values
             dist = self.actor.get_dist(states)
             logprobs = dist.log_prob(actions).sum(dim=-1)
             dist_entropy = dist.entropy().sum(dim=-1)
             state_values = self.critic(states).squeeze()
 
-            # 计算概率比率 r(theta)
-            ratios = torch.exp(logprobs - old_logprobs.detach())
+            # Ratio
+            ratios = torch.exp(logprobs - old_logprobs)
 
-            # PPO 裁剪损失
+            # Surrogate Loss
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-
-            # 总损失 = 策略损失 + 价值损失 - 熵奖励
+            
             loss = -torch.min(surr1, surr2) + 0.5 * F.mse_loss(state_values, returns) - 0.01 * dist_entropy
 
+            # Take gradient step
             self.optimizer.zero_grad()
             loss.mean().backward()
             self.optimizer.step()
 
-        # 更新完成后清空 buffer
         self.buffer = []
+        self.it += 1
 
     def save(self, path):
         torch.save({
             'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'it': self.it,
-            'type': 'ppo'
+            'critic': self.critic.state_dict()
         }, path)
 
     def load(self, path):
