@@ -216,7 +216,6 @@ if __name__ == "__main__":
 
     env.close()
 
-if __name__ == "__main__":
     # 训练配置
     env_name = "Pendulum-v1"
     env = gym.make(env_name, render_mode="rgb_array")
