@@ -1,300 +1,226 @@
-# an ppo file for RL
-import numpy as np
+import gymnasium as gym
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
+import numpy as np
 from torch.distributions import Normal
-from methods.registry import register_method
-from methods.abstract_methods import RLMethod
 
-class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action, hidden_dim=256):
-        super(Actor, self).__init__()
-        self.l1 = nn.Linear(state_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.mu = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Parameter(torch.ones(1, action_dim) * -0.5)
-        self.max_action = max_action
-
-    def forward(self, state):
-        x = F.relu(self.l1(state))
-        x = F.relu(self.l2(x))
-        mu = self.max_action * torch.tanh(self.mu(x))
-        std = torch.exp(self.log_std)
-        return mu, std
-
-    def get_dist(self, state):
-        mu, std = self.forward(state)
-        return Normal(mu, std)
-
-class Critic(nn.Module):
-    def __init__(self, state_dim, hidden_dim=256):
-        super(Critic, self).__init__()
-        self.l1 = nn.Linear(state_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.l3 = nn.Linear(hidden_dim, 1)
-
-    def forward(self, state):
-        x = F.relu(self.l1(state))
-        x = F.relu(self.l2(x))
-        return self.l3(x)
-
-@register_method("ppo")
-class PPO(RLMethod):
-    def __init__(self, state_dim, action_dim, max_action, params=None):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if params is None:
-            params = {}
-        self.params = params
-        self.gamma = params.get("gamma", 0.99)
-        self.eps_clip = params.get("eps_clip", 0.2)
-        self.gae_lambda = params.get("gae_lambda", 0.95)
-        self.K_epochs = params.get("K_epochs", 10)
-        self.lr = params.get("lr", 3e-4)
-        self.max_action = max_action
-
-        self.actor = Actor(state_dim, action_dim, max_action).to(self.device)
-        self.critic = Critic(state_dim).to(self.device)
-
-        self.optimizer = optim.Adam([
-            {'params': self.actor.parameters(), 'lr': self.lr},
-            {'params': self.critic.parameters(), 'lr': self.lr}
-        ])
-
+class PPOBuffer():
+    def __init__(self, gamma=0.99, lam=0.95):
         self.buffer = []
-        self.it = 0
-
-    def select_action(self, state):
-        # state: (num_envs, state_dim) or (state_dim,)
-        if isinstance(state, tuple):
-            state = state[0]
-        if len(state.shape) == 1:
-            state = state.reshape(1, -1)
+        self.state_buf = []
+        self.action_buf = []
+        self.reward_buf = []
+        self.value_buf = []
+        self.logp_buf = []
+        self.gamma = gamma
+        self.lam = lam
         
-        state = torch.FloatTensor(state).to(self.device)
-        with torch.no_grad():
-            dist = self.actor.get_dist(state)
-            action = dist.sample()
-            action_logprob = dist.log_prob(action).sum(dim=-1)
-            value = self.critic(state)
+    def store(self, state, action, reward, value, logp):
+        self.state_buf.append(state)
+        self.action_buf.append(action)
+        self.reward_buf.append(reward)
+        self.value_buf.append(value)
+        self.logp_buf.append(logp)
+    
+    def clear(self):
+        self.state_buf = []
+        self.action_buf = []
+        self.reward_buf = []
+        self.value_buf = []
+        self.logp_buf = []
         
-        action = torch.clamp(action, -self.max_action, self.max_action)
-        return action.cpu().data.numpy(), action_logprob.cpu().data.numpy(), value.cpu().data.numpy()
+    def reset(self):
+        self.buffer = []
+        self.clear()
+    
+    def end_trajectory(self, last_value=0):
+        # 1. to np arrays
+        rewards = np.array(self.reward_buf + [last_value], dtype=np.float32)
+        values = np.array(self.value_buf + [last_value], dtype=np.float32)
+        # 2. compute deltas
+        deltas = rewards[:-1] + self.gamma * values[1:] - values[:-1]
+        
+        # 3. compute advantage estimates (GAE)
+        adv = np.zeros_like(deltas, dtype=np.float32)
+        running_adv = 0.0
+        for t in reversed(range(len(self.action_buf))):
+            running_adv = deltas[t] + self.gamma * self.lam * running_adv
+            adv[t] = running_adv
+        
+        returns = np.zeros_like(rewards, dtype=np.float32)
+        running_ret = 0.0
+        for t in reversed(range(len(rewards))):
+            running_ret = rewards[t] + self.gamma * running_ret
+            returns[t] = running_ret
+        returns = returns[:-1]
+        
+        # 4. compute returns (Lambda Return)
+        # returns = adv + values[:-1]
+        
+        # 5. store to buffer
+        for i in range(len(self.action_buf)):
+            self.buffer.append((self.state_buf[i], self.action_buf[i], adv[i], returns[i], self.logp_buf[i]))
+        self.clear()
 
-    def store_transition(self, transition):
-        # transition: (state, next_state, action, action_logprob, reward, done, value)
-        # We store the batch directly.
-        self.buffer.append(transition)
+class MLPActor(nn.Module):
+    def __init__(self, state_dim, action_dim, action_bound, hidden_sizes=[64, 64]):
+        super(MLPActor, self).__init__()
+        self.l1 = nn.Linear(state_dim, hidden_sizes[0])
+        self.l2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
+        self.l3 = nn.Linear(hidden_sizes[1], action_dim)
+        self.log_std = nn.Parameter(-0.5 * torch.ones(action_dim))
+        self.action_bound = action_bound
 
+    def forward(self, state):
+        a = F.relu(self.l1(state))
+        a = F.relu(self.l2(a))
+        a = self.l3(a)
+        return a, self.log_std
+    
+    def logp_calc(self, state, action):
+        mu, log_std = self.forward(state)
+        std = torch.exp(log_std)
+        dist = Normal(mu, std)
+        # 注意：这里的 action 应该是 raw action (unclamped)
+        logp = dist.log_prob(action).sum(axis=-1)
+        entropy = dist.entropy().sum(axis=-1)
+        return logp, entropy
+    
+    def sample_action(self, state):
+        mu, log_std = self.forward(state)
+        std = torch.exp(log_std)
+        dist = Normal(mu, std)
+        action = dist.sample()
+        logp = dist.log_prob(action).sum(axis=-1)
+        env_action = action.clamp(-self.action_bound, self.action_bound)
+        return action, env_action, logp
+
+class MLPCritic(nn.Module):
+    def __init__(self, state_dim, hidden_sizes=[64, 64]):
+        super(MLPCritic, self).__init__()
+        self.l1 = nn.Linear(state_dim, hidden_sizes[0])
+        self.l2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
+        self.l3 = nn.Linear(hidden_sizes[1], 1)
+
+    def forward(self, state):
+        v = F.relu(self.l1(state))
+        v = F.relu(self.l2(v))
+        v = self.l3(v)
+        return torch.squeeze(v, -1)
+
+class PPO():
+    def __init__(self, env, actor_lr=3e-4, critic_lr=1e-3, gamma=0.99, lam=0.95, 
+                 eps_clip=0.2, A_epochs=10, C_epochs=80, batch_size=64, 
+                 hidden_sizes=[64, 64], target_kl=0.01): # 添加 target_kl
+        self.env = env
+        self.obs_dim = env.observation_space.shape[0]
+        self.act_dim = env.action_space.shape[0]
+        self.action_bound = float(env.action_space.high[0])
+        
+        self.actor = MLPActor(self.obs_dim, self.act_dim, self.action_bound, hidden_sizes)
+        self.critic = MLPCritic(self.obs_dim, hidden_sizes)
+        
+        self.actor.optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic.optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        
+        self.buffer = PPOBuffer(gamma, lam)
+        
+        self.eps_clip = eps_clip
+        self.A_epochs = A_epochs
+        self.C_epochs = C_epochs
+        self.batch_size = batch_size
+        self.target_kl = target_kl # 存储
+    
     def update(self):
-        if len(self.buffer) == 0:
-            return
-
-        # Optimize buffer processing: Transpose list of tuples to tuple of lists
-        batch = list(zip(*self.buffer))
+        states, actions, adv, returns, old_logprobs = zip(*self.buffer.buffer)
         
-        # Convert to tensors efficiently
-        # Stack along time dimension (dim 0)
-        # Result shape: (buffer_steps, num_envs, ...)
-        states = torch.tensor(np.array(batch[0]), dtype=torch.float32).to(self.device)
-        # next_states = torch.tensor(np.array(batch[1]), dtype=torch.float32).to(self.device)
-        actions = torch.tensor(np.array(batch[2]), dtype=torch.float32).to(self.device)
-        old_logprobs = torch.tensor(np.array(batch[3]), dtype=torch.float32).to(self.device)
-        rewards = torch.tensor(np.array(batch[4]), dtype=torch.float32).to(self.device)
-        dones = torch.tensor(np.array(batch[5]), dtype=torch.float32).to(self.device)
-        values = torch.tensor(np.array(batch[6]), dtype=torch.float32).to(self.device)
-
-        # Calculate Advantages using GAE
+        states = torch.tensor(np.array(states), dtype=torch.float32)
+        actions = torch.tensor(np.array(actions), dtype=torch.float32)
+        adv = torch.tensor(np.array(adv), dtype=torch.float32)
+        returns = torch.tensor(np.array(returns), dtype=torch.float32)
+        logp_old = torch.tensor(np.array(old_logprobs), dtype=torch.float32)
+        
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        
         with torch.no_grad():
-            # We need next states for all steps to compute next_values
-            # But actually we only need next_values for the GAE calculation.
-            # If we stored next_states, we can use them.
-            next_states = torch.tensor(np.array(batch[1]), dtype=torch.float32).to(self.device)
-            next_values = self.critic(next_states).squeeze(-1) # (buffer_steps, num_envs)
-            
-            # Values shape: (buffer_steps, num_envs) (if critic output is (batch, 1))
-            if values.dim() == 3: values = values.squeeze(-1)
-            
-            # delta = r + gamma * V(s') * (1-done) - V(s)
-            deltas = rewards + self.gamma * next_values * (1 - dones) - values
-            
-            # Vectorized GAE calculation
-            deltas_np = deltas.cpu().numpy()
-            dones_np = dones.cpu().numpy()
-            advantages_np = np.zeros_like(deltas_np)
-            gae = 0
-            
-            # Loop backwards over time steps
-            for t in reversed(range(len(deltas_np))):
-                # If done, reset GAE. dones_np[t] is (num_envs,)
-                # We need to handle masking per environment.
-                # gae = delta + gamma * lambda * gae * (1 - done)
-                gae = deltas_np[t] + self.gamma * self.gae_lambda * gae * (1 - dones_np[t])
-                advantages_np[t] = gae
-                
-            advantages = torch.tensor(advantages_np, dtype=torch.float32).to(self.device)
+            old_total_rewards = returns.sum().item()
+            value_pred = self.critic(states)
+            # old_value_loss = F.mse_loss(value_pred, returns)
+            logp, ent = self.actor.logp_calc(states, actions)
+            # old_kl = (logp_old - logp).mean().item()
         
-        returns = advantages + values
-
-        # Flatten the batch for training: (buffer_steps * num_envs, ...)
-        states = states.reshape(-1, states.shape[-1])
-        actions = actions.reshape(-1, actions.shape[-1])
-        old_logprobs = old_logprobs.reshape(-1)
-        returns = returns.reshape(-1)
-        advantages = advantages.reshape(-1)
-        
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
-
-        # Optimize policy for K epochs
-        for _ in range(self.K_epochs):
-            # Calculate current logprobs and values
-            dist = self.actor.get_dist(states)
-            logprobs = dist.log_prob(actions).sum(dim=-1)
-            dist_entropy = dist.entropy().sum(dim=-1)
-            state_values = self.critic(states).squeeze()
-
-            # Ratio
-            ratios = torch.exp(logprobs - old_logprobs)
-
-            # Surrogate Loss
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+        for i in range(self.A_epochs):
+            self.actor.optimizer.zero_grad()
+            logp, _ = self.actor.logp_calc(states, actions)
+            ratio = torch.exp(logp - logp_old)
             
-            loss = -torch.min(surr1, surr2) + 0.5 * F.mse_loss(state_values, returns) - 0.01 * dist_entropy
+            surr1 = ratio * adv
+            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * adv
+            actor_loss = -torch.min(surr1, surr2).mean()
+            
+            kl = (logp_old - logp).mean().item()
+            if kl > 1.5 * self.target_kl:
+                # print(f"Early stopping at epoch {i} with KL {kl:.4f}")
+                break
+            actor_loss.backward()
+            self.actor.optimizer.step()
 
-            # Take gradient step
-            self.optimizer.zero_grad()
-            loss.mean().backward()
-            self.optimizer.step()
-
-        self.buffer = []
-        self.it += 1
-
-    def save(self, path):
-        torch.save({
-            'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict()
-        }, path)
-
-    def load(self, path):
-        ckpt = torch.load(path, map_location=self.device)
-        self.actor.load_state_dict(ckpt['actor'])
-        self.critic.load_state_dict(ckpt['critic'])
-        self.optimizer.load_state_dict(ckpt['optimizer'])
-        self.it = ckpt.get('it', self.it)
-
+        for _ in range(self.C_epochs):
+            value_pred = self.critic(states)
+            critic_loss = F.mse_loss(value_pred, returns)
+            self.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic.optimizer.step()
+            
+        # Logging (Optional simplified)
+        print(f"Update: Policy Loss {actor_loss.item():.4f} | Value Loss {critic_loss.item():.4f} | KL {kl:.4f}")
+        
+        self.buffer.reset()    
 
 if __name__ == "__main__":
-    # 训练配置
-    env_name = "Pendulum-v1"
-    env = gym.make(env_name, render_mode="rgb_array")
+    env = gym.make('Pendulum-v1')
+    ppo = PPO(env, target_kl=0.02) # 稍微调大一点点 KL 限制，Pendulum 比较耐造
     
-    # 视频录制
-    env = RecordVideo(
-        env,
-        video_folder="output/videos/",
-        episode_trigger=lambda ep_id: ep_id % 100 == 0,
-        name_prefix="ppo_pendulum"
-    )
-
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-    max_action = float(env.action_space.high[0])
-
-    agent = PPO(state_dim, action_dim, max_action)
+    max_epochs = 200 # 总共更新 100 次
+    episodes_per_epoch = 20 # 每次更新收集 20 个 episode
     
-    save_dir = "output/checkpoints"
-    os.makedirs(save_dir, exist_ok=True)
-
-    max_episodes = 1000
-    update_timestep = 2000  # 每收集 2000 步更新一次
-    timestep = 0
-
-    for i_episode in tqdm(range(1, max_episodes + 1)):
-        state, _ = env.reset()
-        episode_reward = 0
-        
-        for t in range(1, 500): # Pendulum 每回合最多 200 步，这里设大一点
-            timestep += 1
-            
-            # 选择动作
-            action, action_logprob, value = agent.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            
-            # 存储轨迹
-            agent.store_transition((state, action, action_logprob, reward, done, value))
-            
-            state = next_state
-            episode_reward += reward
-
-            # 定期更新
-            if timestep % update_timestep == 0:
-                agent.update()
-
-            if done:
-                break
-        
-        if i_episode % 100 == 0:
-            print(f"Episode {i_episode} \t Reward: {episode_reward:.2f}")
-            agent.save(os.path.join(save_dir, "ppo_latest.pt"))
-
-    env.close()
-
-    # 训练配置
-    env_name = "Pendulum-v1"
-    env = gym.make(env_name, render_mode="rgb_array")
+    total_steps = 0
     
-    # 视频录制
-    env = RecordVideo(
-        env,
-        video_folder="output/videos/",
-        episode_trigger=lambda ep_id: ep_id % 100 == 0,
-        name_prefix="ppo_pendulum"
-    )
-
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-    max_action = float(env.action_space.high[0])
-
-    agent = PPO(state_dim, action_dim, max_action)
-    
-    save_dir = "output/checkpoints"
-    os.makedirs(save_dir, exist_ok=True)
-
-    max_episodes = 1000
-    update_timestep = 2000  # 每收集 2000 步更新一次
-    timestep = 0
-
-    for i_episode in tqdm(range(1, max_episodes + 1)):
-        state, _ = env.reset()
-        episode_reward = 0
+    for epoch in range(max_epochs):
+        episode_rewards = []
+        for _ in range(episodes_per_epoch):
+            state, _ = env.reset()
+            ep_reward = 0
+            while True:
+                state_tensor = torch.tensor(state, dtype=torch.float32).reshape(1, -1)
+                
+                # 获取动作
+                raw_action_tensor, env_action_tensor, logp_tensor = ppo.actor.sample_action(state_tensor)
+                
+                # 转换: Raw Action 存 buffer, Env Action 给环境
+                raw_action = raw_action_tensor.detach().numpy()[0]
+                env_action = env_action_tensor.detach().numpy()[0]
+                logp = logp_tensor.item()
+                
+                next_state, reward, terminated, truncated, _ = env.step(env_action)
+                
+                # 存 Raw Action
+                ppo.buffer.store(state, raw_action, reward, ppo.critic(state_tensor).item(), logp)
+                
+                state = next_state
+                ep_reward += reward
+                total_steps += 1
+                
+                if terminated or truncated:
+                    last_state_tensor = torch.tensor(next_state, dtype=torch.float32).reshape(1, -1)
+                    last_value = ppo.critic(last_state_tensor).item() if truncated else 0
+                    ppo.buffer.end_trajectory(last_value)
+                    episode_rewards.append(ep_reward)
+                    break
         
-        for t in range(1, 500): # Pendulum 每回合最多 200 步，这里设大一点
-            timestep += 1
-            
-            # 选择动作
-            action, action_logprob, value = agent.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            
-            # 存储轨迹
-            agent.store_transition((state, action, action_logprob, reward, done, value))
-            
-            state = next_state
-            episode_reward += reward
-
-            # 定期更新
-            if timestep % update_timestep == 0:
-                agent.update()
-
-            if done:
-                break
+        avg_reward = np.mean(episode_rewards)
+        print(f"Epoch {epoch+1}/{max_epochs} | Avg Reward: {avg_reward:.2f} | Steps: {total_steps}")
+        ppo.update()
         
-        if i_episode % 100 == 0:
-            print(f"Episode {i_episode} \t Reward: {episode_reward:.2f}")
-            agent.save(os.path.join(save_dir, "ppo_latest.pt"))
-
     env.close()
