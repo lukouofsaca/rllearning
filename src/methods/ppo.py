@@ -93,7 +93,9 @@ class MLPActor(nn.Module):
         dist = Normal(mu, std)
         action = dist.sample()
         logp = dist.log_prob(action).sum(axis=-1)
-        env_action = action.clamp(-self.action_bound, self.action_bound)
+        # use tanh to squash the action within [-action_bound, action_bound]
+        env_action = torch.tanh(action) * self.action_bound
+        # env_action = action.clamp(-self.action_bound, self.action_bound)
         return action, env_action, logp
 
 class MLPCritic(nn.Module):
@@ -131,6 +133,12 @@ class PPO():
         self.C_epochs = C_epochs
         self.batch_size = batch_size
         self.target_kl = target_kl # 存储
+    
+        # for drawing action
+        self.lossV_history = []
+        self.lossPi_history = []
+        self.kl_history = []
+    
     
     def update(self):
         states, actions, adv, returns, old_logprobs = zip(*self.buffer.buffer)
@@ -175,8 +183,31 @@ class PPO():
             
         # Logging (Optional simplified)
         print(f"Update: Policy Loss {actor_loss.item():.4f} | Value Loss {critic_loss.item():.4f} | KL {kl:.4f}")
-        
+        self.lossPi_history.append(actor_loss.item())
+        self.lossV_history.append(critic_loss.item())
+        self.kl_history.append(kl)
         self.buffer.reset()    
+        
+    def draw_history(self):
+        
+        import matplotlib.pyplot as plt
+        
+        plt.figure(figsize=(12,4))
+        
+        plt.subplot(1,3,1)
+        plt.plot(self.lossPi_history)
+        plt.title("Policy Loss")
+        
+        plt.subplot(1,3,2)
+        plt.plot(self.lossV_history)
+        plt.title("Value Loss")
+        
+        plt.subplot(1,3,3)
+        plt.plot(self.kl_history)
+        plt.title("KL Divergence")
+        
+        plt.tight_layout()
+        # return plt
 
 if __name__ == "__main__":
     env = gym.make('Pendulum-v1')
@@ -186,6 +217,10 @@ if __name__ == "__main__":
     episodes_per_epoch = 20 # 每次更新收集 20 个 episode
     
     total_steps = 0
+    # for drawing reward curve
+    reward_history = []
+    
+    
     
     for epoch in range(max_epochs):
         episode_rewards = []
@@ -224,3 +259,9 @@ if __name__ == "__main__":
         ppo.update()
         
     env.close()
+    import matplotlib.pyplot as plt
+    ppo.draw_history()
+    import os
+    os.makedirs("output/picture/", exist_ok=True)
+    plt.savefig("output/picture/ppo_training_history.png")
+    
