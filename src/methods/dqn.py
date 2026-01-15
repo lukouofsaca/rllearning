@@ -94,11 +94,11 @@ class DQN(RLMethod):
         if self.replay_buffer.size < self.batch_size:
             return
 
-        state, action, next_state, reward, not_done = self.replay_buffer.sample(self.batch_size)
+        state, action, next_state, reward, done = self.replay_buffer.sample(self.batch_size)
 
         with torch.no_grad():
             target_Q = self.target_q_net(next_state).max(1, keepdim=True)[0]
-            target_Q = reward + not_done * self.gamma * target_Q
+            target_Q = reward + (1-done) * self.gamma * target_Q
 
         current_Q = self.q_net(state).gather(1, action.long())
 
