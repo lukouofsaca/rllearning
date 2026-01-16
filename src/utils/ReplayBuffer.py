@@ -17,7 +17,7 @@ class ReplayBuffer:
         self.action[self.ptr] = action
         self.next_state[self.ptr] = next_state
         self.reward[self.ptr] = reward
-        self.done[self.ptr] = 1. - done
+        self.done[self.ptr] = done
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 

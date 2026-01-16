@@ -24,17 +24,21 @@ class QNetwork(nn.Module):
 @register_method("dqn")
 class DQN(RLMethod):
     def __init__(self, state_dim, action_dim, max_action, params=None):
+        """
+        max_action is useless now, just for compatibility.
+        """
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if params is None:
             params = {}
         self.params = params
         self.action_dim = action_dim
-        
+        self.max_action = max_action
         # DQN Hyperparameters
         self.gamma = params.get("gamma", 0.99)
         self.tau = params.get("tau", 0.005)
         self.lr = params.get("lr", 3e-4)
-        self.batch_size = params.get("batch_size", 256)
+        self.batch_size = params.get("batch_size", 2)
         self.epsilon = params.get("epsilon", 1.0)
         self.epsilon_decay = params.get("epsilon_decay", 0.995)
         self.epsilon_min = params.get("epsilon_min", 0.01)
@@ -59,49 +63,32 @@ class DQN(RLMethod):
         else:
             batch_size = state.shape[0]
 
-        if np.random.random() < self.epsilon:
-            action = np.random.randint(0, self.action_dim, size=batch_size)
-        else:
-            state = torch.FloatTensor(state).to(self.device)
-            with torch.no_grad():
-                q_values = self.q_net(state)
-                action = q_values.argmax(dim=1).cpu().numpy()
-        
-        # Decay epsilon
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        
+
+        state = torch.FloatTensor(state).to(self.device)
+        with torch.no_grad():
+            q_values = self.q_net(state)
+            action = q_values.argmax(dim=1).cpu().numpy()        
+                
         return action, None, None
 
     def store_transition(self, transition):
-        state, next_state, action, action_logprob, reward, done, value = transition
+        state, next_state, action, reward, done = transition
         
-        # Check if inputs are batches
-        if len(state.shape) > 1 and state.shape[0] > 1:
-            # Iterate over batch
-            for i in range(state.shape[0]):
-                self.replay_buffer.add(state[i], action[i], next_state[i], reward[i], done[i])
-        else:
-            # Single transition
-            # Ensure scalar/1D array consistency
-            s = state if len(state.shape) == 1 else state[0]
-            ns = next_state if len(next_state.shape) == 1 else next_state[0]
-            a = action if np.isscalar(action) or action.ndim==0 else action[0]
-            r = reward if np.isscalar(reward) or reward.ndim==0 else reward[0]
-            d = done if np.isscalar(done) or done.ndim==0 else done[0]
-            self.replay_buffer.add(s, a, ns, r, d)
+
+        self.replay_buffer.add(state, action, next_state, reward, done)
 
     def update(self):
         if self.replay_buffer.size < self.batch_size:
             return
-
         state, action, next_state, reward, done = self.replay_buffer.sample(self.batch_size)
 
         with torch.no_grad():
             target_Q = self.target_q_net(next_state).max(1, keepdim=True)[0]
-            target_Q = reward + (1-done) * self.gamma * target_Q
+            target_Q = reward + (1 - done) * self.gamma * target_Q
 
         current_Q = self.q_net(state).gather(1, action.long())
-
+        
+        # print(current_Q, target_Q)
         loss = F.mse_loss(current_Q, target_Q)
 
         self.optimizer.zero_grad()
@@ -119,3 +106,75 @@ class DQN(RLMethod):
 
     def load(self, path):
         self.q_net.load_state_dict(torch.load(path))
+        
+
+
+if __name__ == "__main__":
+    import gymnasium as gym
+    from utils.ActionWrapper import EpsilonGreedyActionWrapper
+
+    env_name = "CartPole-v1"
+    steps = 100000
+    minibatch_size = 64
+    cold_start_steps = 1000
+    epsilon = 0.1
+    
+    
+    env = gym.make(env_name)
+    
+    ## 假设单维离散动作空间
+    action_space = env.action_space
+    action_space_dim = action_space.n    
+    action_dim = 1
+    
+    state_dim = env.observation_space.shape[0]
+    
+    network = DQN(state_dim, action_space_dim, None)
+    
+    state , _ = env.reset()
+    
+    action_wrapper = EpsilonGreedyActionWrapper(epsilon, action_dim, action_space)
+    
+    def select_action(network, state):
+        action, _, _ = network.select_action(state)
+        # to action space
+        action = action_wrapper(action)
+        if isinstance(action, np.ndarray):
+            action = action.item()
+        return action
+    
+    
+    reward_history = []
+    episodereward = 0
+    episode = 0
+    for i in range(steps):
+        # cold start
+        
+        if i < cold_start_steps:
+            action = env.action_space.sample()
+        else:
+            action = select_action(network, state)
+        
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated
+        network.store_transition((state, next_state, action, reward, done))
+        state = next_state
+        # reset network
+        episodereward += reward
+        if terminated or truncated:
+            state, _ = env.reset()
+            episode += 1
+            reward_history.append(episodereward)
+            episodereward = 0
+            # print(f"Step: {i}, Episode Reward: {reward_history[-1]:.2f}, Epsilon: {network.epsilon:.3f}")
+    
+        # update network
+        if i >= cold_start_steps:
+            for j in range(1):  
+                network.update()
+        if (i + 1) % 1000 == 0:
+            avg_reward = np.mean(reward_history[-10:]) if len(reward_history) >=10 else np.mean(reward_history)
+            print(f"Step: {i+1}, Episode: {episode}, Avg Reward(10): {avg_reward:.2f}, Epsilon: {network.epsilon:.3f}")
+                
+    
+            
